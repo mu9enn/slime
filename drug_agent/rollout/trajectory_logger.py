@@ -84,8 +84,14 @@ def _build_row(sample: Sample, rollout_id: int) -> dict[str, Any]:
         "recovered_valid_count": int(trace.get("recovered_valid_count") or 0),
         "num_tool_success": int(trace.get("num_tool_success") or 0),
         "num_tool_error": int(trace.get("num_tool_error") or 0),
+        "num_tool_schema_error": int(trace.get("num_tool_schema_error") or 0),
+        "num_tool_execution_success": int(trace.get("num_tool_execution_success") or 0),
+        "num_tool_semantic_error": int(trace.get("num_tool_semantic_error") or 0),
+        "num_tool_semantic_unknown": int(trace.get("num_tool_semantic_unknown") or 0),
+        "num_transport_error": int(trace.get("num_transport_error") or 0),
         "strict_success_rate": float(trace.get("strict_success_rate") or 0.0),
         "recovery_success_rate": float(trace.get("recovery_success_rate") or 0.0),
+        "tool_execution_success_rate": float(trace.get("tool_execution_success_rate") or 0.0),
         "truncated": bool(trace.get("truncated") or sample.status == Sample.Status.TRUNCATED),
         "error": trace.get("error"),
         "sample_status": sample.status.value,
@@ -104,18 +110,26 @@ def _inject_metrics(rollout_extra_metrics: dict[str, Any] | None, rows: list[dic
     total_recovered_valid = sum(int(r.get("recovered_valid_count") or 0) for r in rows)
     total_tool_success = sum(int(r.get("num_tool_success") or 0) for r in rows)
     total_tool_error = sum(int(r.get("num_tool_error") or 0) for r in rows)
+    total_tool_schema_error = sum(int(r.get("num_tool_schema_error") or 0) for r in rows)
+    total_tool_execution_success = sum(int(r.get("num_tool_execution_success") or 0) for r in rows)
+    total_tool_semantic_unknown = sum(int(r.get("num_tool_semantic_unknown") or 0) for r in rows)
 
     action_valid_rate = (total_actions - total_invalid) / max(1, total_actions)
     strict_success_rate = total_strict_valid / max(1, total_actions)
     recovery_success_rate = total_recovered_valid / max(1, total_actions)
     total_tool_calls = total_tool_success + total_tool_error
+    execution_attempt_count = total_tool_calls - total_tool_schema_error
     tool_success_rate = total_tool_success / max(1, total_tool_calls)
+    tool_execution_success_rate = total_tool_execution_success / max(1, execution_attempt_count)
+    tool_semantic_unknown_rate = total_tool_semantic_unknown / max(1, execution_attempt_count)
     final_success_rate = sum(1 for r in rows if r.get("done_reason") == "final_answer") / max(1, len(rows))
 
     rollout_extra_metrics["action_valid_rate"] = action_valid_rate
     rollout_extra_metrics["strict_success_rate"] = strict_success_rate
     rollout_extra_metrics["recovery_success_rate"] = recovery_success_rate
     rollout_extra_metrics["tool_success_rate"] = tool_success_rate
+    rollout_extra_metrics["tool_execution_success_rate"] = tool_execution_success_rate
+    rollout_extra_metrics["tool_semantic_unknown_rate"] = tool_semantic_unknown_rate
     rollout_extra_metrics["final_success_rate"] = final_success_rate
 
 

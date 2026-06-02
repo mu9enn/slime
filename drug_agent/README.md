@@ -24,6 +24,8 @@ drug_agent/
   protocol/
     action_schema.py
     action_parser.py
+    parse_policy.py
+    react_protocol.py
     prompts.py
   data/
     inspect_pipelined_data.py
@@ -33,6 +35,7 @@ drug_agent/
   tools/
     mcp_client.py
     tool_executor.py
+    tool_success.py
     tool_registry.py
     allowlist_v0.json
   rollout/
@@ -52,6 +55,7 @@ drug_agent/
     debug_replay_trajectory.py
     debug_one_task.py
     debug_reward.py
+    debug_training_compliance.py  # deprecated helper only
 ```
 
 ## Environment
@@ -84,6 +88,7 @@ Optional plugin controls:
 - `DRUG_AGENT_ALLOW_ALL` (`0` or `1`)
 - `DRUG_AGENT_ROLLOUT_MODE` (default: `train_strict`; optional `debug_permissive`)
 - `DRUG_AGENT_ALLOW_PARSE_RECOVERY` (default: `0`; set `1` only for diagnostics)
+- `DRUG_AGENT_UNKNOWN_SEMANTIC_AS_FAILURE` (default: `1`)
 - `DRUG_AGENT_RUN_NAME`
 - `OUTPUTS_ROOT` (default: `$WD/outputs`)
 - `DRUG_AGENT_DATA_ROOT` (default: `$OUTPUTS_ROOT/slime_drug_agent_data`)
@@ -138,9 +143,20 @@ Outputs:
 - `skipped_report.jsonl`
 - `manifest.json`
 
+Note:
+
+- This converter is legacy compatibility only and still emits action-json SFT.
+- Canonical ReAct-style SFT now comes from the upstream `pipeline/postprocess` path.
+
 ## Protocol
 
-Agent output must be a single raw JSON object per turn.
+### RL / online rollout protocol
+
+The online training stack in this repo still uses action-json for rollout:
+
+- one assistant turn contains one strict JSON object
+- supported actions are `tool_call` and `final_answer`
+- no markdown fences, XML, or prose wrappers
 
 Tool call:
 
@@ -160,6 +176,27 @@ Parser rejects:
 - XML
 - Natural language wrappers around JSON
 
+### ReAct SFT protocol
+
+The canonical SFT data path now consumes ReAct-style tagged messages produced upstream by `pipeline/postprocess`:
+
+- `<thought>...</thought>`
+- `<tool_call>...</tool_call>`
+- `<observation tool_name="...">...</observation>`
+- `<final_answer>...</final_answer>`
+
+Use the validator with the ReAct protocol once the upstream postprocess output is available:
+
+```bash
+python drug_agent/data/validate_sft_messages.py \
+  --input "$DRUG_AGENT_DATA_ROOT/sft/mixed.jsonl" \
+  --protocol react_json \
+  --tokenizer "$VERL_DATA/Qwen3.5-0.8B"
+```
+
+If you still need to inspect legacy action-json SFT, use `--protocol action_json` or `--protocol auto`.
+If you are inspecting the current legacy compatibility `mixed.jsonl`, `--protocol auto` may report mixed/legacy records by design.
+
 Self-test:
 
 ```bash
@@ -171,8 +208,17 @@ Validate SFT messages before training:
 ```bash
 python drug_agent/data/validate_sft_messages.py \
   --input "$DRUG_AGENT_DATA_ROOT/sft/mixed.jsonl" \
+  --protocol react_json \
   --tokenizer "$VERL_DATA/Qwen3.5-0.8B"
 ```
+
+Run compliance audit:
+
+```bash
+python drug_agent/tools_debug/debug_training_compliance.py
+```
+
+This helper is deprecated and informational only. It is no longer the training authority.
 
 ## Train Entrypoints
 
@@ -200,6 +246,28 @@ SFT smoke (slime native SFT: `sft_rollout + sft_loss`):
 bash drug_agent/scripts/run_qwen3_5_0_8b_drug_sft_smoke.sh
 ```
 
+The SFT smoke script accepts either a `.jsonl` file or a directory of per-sample `.json` files via `PROMPT_DATA`. If a directory is provided, it will materialize a stable `*.train.jsonl` next to the source directory before validation and training.
+
+For Qwen3.5 ReAct-SFT, the script explicitly uses `--loss-mask-type qwen3_5`. Using slime's default `qwen` loss-mask path will fail on multi-turn ReAct observation data with `No user query found in messages`.
+
+The same SFT script can be reused across model sizes by overriding `MODEL_ARGS_FILE`, for example `scripts/models/qwen3.5-4B.sh` or `scripts/models/qwen3.5-27B.sh`.
+
+When shrinking the smoke on a 2-GPU worker, keep `GLOBAL_BATCH_SIZE` divisible by `NUM_GPUS`. For example, `GLOBAL_BATCH_SIZE=2` is valid on 2 GPUs, while `GLOBAL_BATCH_SIZE=1` will fail later in Megatron with a batch divisibility assertion.
+
+Optional debug-only switch (default off):
+
+```bash
+SFT_DEBUG_TRAIN_ONLY=1 bash drug_agent/scripts/run_qwen3_5_0_8b_drug_sft_smoke.sh
+```
+
+Mask debug:
+
+```bash
+python drug_agent/tools_debug/debug_sft_mask_qwen.py \
+  --input "$GROUP_SPACE/slime_wd/data/mcp_sft_all" \
+  --tokenizer "$VERL_DATA/Qwen3.5-0.8B"
+```
+
 ## Rollout + Reward + Trace
 
 - Custom generate: `drug_agent.rollout.generate_with_drug_agent.generate`
@@ -218,6 +286,8 @@ Logged metrics include:
 - `strict_success_rate`
 - `recovery_success_rate`
 - `tool_success_rate`
+- `tool_execution_success_rate`
+- `tool_semantic_unknown_rate`
 - `final_success_rate`
 
 Strict/diagnostic parsing policy:
@@ -226,6 +296,7 @@ Strict/diagnostic parsing policy:
 - In `train_strict`, model output must be a full valid JSON object; parse failure becomes `invalid_action` and no tool is executed.
 - `debug_permissive` is only for debug tools. It allows JSON extraction recovery and records `parse_recovery=true` in trace.
 - Even when recovery is explicitly enabled (`DRUG_AGENT_ALLOW_PARSE_RECOVERY=1`), reward includes `parse_recovery_penalty`.
+- Tool success is semantic-level by default (not transport-level). Unknown semantic status is treated as failure by default.
 
 ## Tool Debug
 

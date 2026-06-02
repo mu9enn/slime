@@ -15,10 +15,11 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from drug_agent.constants import VERL_DATA
-from drug_agent.protocol.action_parser import parse_action
+from drug_agent.protocol.parse_policy import parse_action_with_policy
 from drug_agent.protocol.action_schema import ACTION_FINAL_ANSWER, ACTION_TOOL_CALL
 from drug_agent.tools.tool_executor import MCPToolExecutor
 from drug_agent.tools.tool_registry import ToolRegistry, load_allowlist
+from drug_agent.tools.tool_success import make_validation_failed_result
 from drug_agent.tools_debug.sglang_launcher import detect_sglang_launch_command
 from drug_agent.utils import append_jsonl, ensure_dir, normalize_tool_name, to_jsonable
 
@@ -194,59 +195,6 @@ def _sample_context(row: dict[str, Any]) -> dict[str, Any]:
 
 def _serialize_observation(payload: dict[str, Any]) -> str:
     return json.dumps({"observation": to_jsonable(payload)}, ensure_ascii=False, separators=(",", ":"))
-
-
-def _extract_json_object_candidate(text: str) -> str | None:
-    if not isinstance(text, str):
-        return None
-    decoder = json.JSONDecoder()
-    candidates: list[tuple[int, int, str]] = []
-    for start, ch in enumerate(text):
-        if ch != "{":
-            continue
-        snippet = text[start:]
-        try:
-            obj, end = decoder.raw_decode(snippet)
-        except Exception:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        candidate = snippet[:end]
-        tail = snippet[end:].strip()
-        score = 0
-        if "type" in obj:
-            score += 10
-        if tail == "":
-            score += 3
-        if isinstance(obj.get("type"), str):
-            score += 2
-        # Prefer higher score and earlier JSON with similar score.
-        candidates.append((score, -start, candidate))
-    if not candidates:
-        return None
-    candidates.sort(reverse=True)
-    return candidates[0][2]
-
-
-def _parse_action_with_recovery(raw_model_output: str):
-    parsed = parse_action(raw_model_output)
-    if parsed.ok:
-        return parsed, None, raw_model_output
-
-    candidate = _extract_json_object_candidate(raw_model_output)
-    if candidate and candidate.strip() != raw_model_output.strip():
-        repaired = parse_action(candidate)
-        if repaired.ok:
-            return (
-                repaired,
-                {
-                    "recovered": True,
-                    "strategy": "extract_embedded_json_object",
-                    "candidate_prefix": candidate[:240],
-                },
-                candidate,
-            )
-    return parsed, None, raw_model_output
 
 
 def _missing_mcp_env() -> list[str]:
@@ -484,6 +432,11 @@ def main() -> int:
         num_invalid = 0
         num_tool_success = 0
         num_tool_error = 0
+        num_tool_schema_error = 0
+        num_tool_execution_success = 0
+        num_tool_semantic_error = 0
+        num_tool_semantic_unknown = 0
+        num_transport_error = 0
         done_reason: str | None = None
         final_answer: dict[str, Any] | None = None
 
@@ -496,7 +449,10 @@ def main() -> int:
                 max_new_tokens=args.max_new_tokens,
             )
 
-            parsed, parse_recovery, normalized_model_output = _parse_action_with_recovery(raw_model_output)
+            parsed, parse_recovery, normalized_model_output, parse_source = parse_action_with_policy(
+                raw_model_output,
+                parse_recovery_enabled=True,
+            )
             action_valid = bool(parsed.ok)
             if not action_valid:
                 num_invalid += 1
@@ -535,21 +491,34 @@ def main() -> int:
                     ok_name, reason_name = registry.validate_tool_name(tool_name, allowed_tools=allowed_tools)
                     ok_args, reason_args = registry.validate_arguments_basic(tool_name, tool_args)
                     if not ok_name or not ok_args:
-                        tool_result = {
-                            "ok": False,
-                            "tool_name": tool_name,
-                            "result": None,
-                            "error": _error_payload("validation_failed", reason_name or reason_args or "validation failed"),
-                            "latency_sec": 0.0,
-                            "metadata": {"tool_reason": reason_name, "args_reason": reason_args},
-                        }
-                        num_tool_error += 1
+                        tool_result = make_validation_failed_result(
+                            tool_name=tool_name,
+                            message=reason_name or reason_args or "validation failed",
+                            tool_reason=reason_name,
+                            args_reason=reason_args,
+                        )
                     else:
                         tool_result = executor.execute(tool_name, tool_args)
-                        if bool(tool_result.get("ok")):
-                            num_tool_success += 1
-                        else:
-                            num_tool_error += 1
+
+                transport_ok = bool(tool_result.get("transport_ok"))
+                tool_schema_valid = bool(tool_result.get("tool_schema_valid"))
+                tool_execution_success = bool(tool_result.get("tool_execution_success"))
+                tool_semantic_success = bool(tool_result.get("tool_semantic_success"))
+                semantic_unknown = bool(tool_result.get("semantic_unknown"))
+
+                if not tool_schema_valid:
+                    num_tool_schema_error += 1
+                if not transport_ok:
+                    num_transport_error += 1
+                if tool_execution_success:
+                    num_tool_execution_success += 1
+                if tool_semantic_success:
+                    num_tool_success += 1
+                else:
+                    num_tool_error += 1
+                    num_tool_semantic_error += 1
+                if semantic_unknown:
+                    num_tool_semantic_unknown += 1
 
                 observation = _serialize_observation(tool_result or {})
                 messages.append({"role": "assistant", "content": raw_model_output})
@@ -583,6 +552,7 @@ def main() -> int:
                 "action_valid": action_valid,
                 "parse_error": parse_error,
                 "parse_recovery": parse_recovery,
+                "parse_source": parse_source,
                 "tool_result": to_jsonable(tool_result),
                 "observation": observation,
                 "reward_components": {},
@@ -601,8 +571,10 @@ def main() -> int:
 
         num_steps = len(steps)
         total_tools = num_tool_success + num_tool_error
+        execution_attempt_count = total_tools - num_tool_schema_error
         action_valid_rate = (num_steps - num_invalid) / max(1, num_steps)
         tool_success_rate = num_tool_success / max(1, total_tools)
+        tool_execution_success_rate = num_tool_execution_success / max(1, execution_attempt_count)
         final_success_rate = 1.0 if done_reason == "final_answer" else 0.0
 
         append_jsonl(
@@ -616,8 +588,14 @@ def main() -> int:
                     "num_invalid": num_invalid,
                     "num_tool_success": num_tool_success,
                     "num_tool_error": num_tool_error,
+                    "num_tool_schema_error": num_tool_schema_error,
+                    "num_tool_execution_success": num_tool_execution_success,
+                    "num_tool_semantic_error": num_tool_semantic_error,
+                    "num_tool_semantic_unknown": num_tool_semantic_unknown,
+                    "num_transport_error": num_transport_error,
                     "action_valid_rate": action_valid_rate,
                     "tool_success_rate": tool_success_rate,
+                    "tool_execution_success_rate": tool_execution_success_rate,
                     "final_success_rate": final_success_rate,
                     "final_answer": to_jsonable(final_answer),
                 }

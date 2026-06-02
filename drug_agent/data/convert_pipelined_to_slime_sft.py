@@ -4,6 +4,7 @@ import argparse
 import json
 from collections import Counter
 from pathlib import Path
+import re
 from typing import Any
 import sys
 
@@ -14,6 +15,33 @@ from drug_agent.constants import RAW_TASK_TYPES, SFT_OUT_ROOT, SFT_OUTPUTS_ANSWE
 from drug_agent.data.common import load_usage_summary_by_basename
 from drug_agent.protocol.action_schema import ACTION_FINAL_ANSWER, ACTION_TOOL_CALL
 from drug_agent.utils import normalize_tool_name, write_json, write_jsonl
+
+
+_FENCED_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_-]*\n(.*?)```", flags=re.DOTALL)
+
+
+def _strip_markdown_fence_text(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    out = text
+    while True:
+        replaced = _FENCED_BLOCK_RE.sub(lambda m: (m.group(1) or "").strip(), out)
+        if replaced == out:
+            break
+        out = replaced
+    out = out.replace("```", "")
+    out = out.replace("<think>", "").replace("</think>", "")
+    return out
+
+
+def _sanitize_json_strings(value: Any) -> Any:
+    if isinstance(value, str):
+        return _strip_markdown_fence_text(value)
+    if isinstance(value, list):
+        return [_sanitize_json_strings(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _sanitize_json_strings(v) for k, v in value.items()}
+    return value
 
 
 def load_allowlist(path: Path | None) -> set[str]:
@@ -106,6 +134,9 @@ def normalize_final_answer(payload: dict[str, Any]) -> tuple[dict[str, Any] | No
     if not isinstance(answer, dict):
         return None, "final_answer_missing_object"
 
+    # Keep action schema while removing markdown-think artifacts inside nested strings.
+    answer = _sanitize_json_strings(answer)
+
     if "summary" not in answer or not isinstance(answer.get("summary"), str):
         return None, "final_answer_summary_invalid"
     if "evidence" not in answer or not isinstance(answer.get("evidence"), list):
@@ -186,7 +217,9 @@ def _ensure_valid_message_structure(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Convert pipelined SFT answer-hit data to slime SFT messages jsonl")
+    parser = argparse.ArgumentParser(
+        description="Legacy compatibility converter for action-json SFT messages. ReAct SFT comes from upstream postprocess."
+    )
     parser.add_argument("--input-jsonl", type=str, default=str(SFT_OUTPUTS_ANSWER_HIT / "mcp_sft_all.jsonl"))
     parser.add_argument("--output-root", type=str, default=str(SFT_OUT_ROOT))
     parser.add_argument("--usage-summary-csv", type=str, default=None)
@@ -200,6 +233,12 @@ def main() -> int:
     input_jsonl = Path(args.input_jsonl)
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+
+    print(
+        "[DEPRECATED] convert_pipelined_to_slime_sft.py emits legacy action_json SFT only. "
+        "Canonical ReAct SFT is produced upstream by pipeline/postprocess.",
+        file=sys.stderr,
+    )
 
     allowlist = load_allowlist(Path(args.allowlist) if args.allowlist else None)
     usage_summary_csv = (
@@ -418,7 +457,9 @@ def main() -> int:
                     "usage_summary": usage,
                     "tool_call_count": tool_call_count,
                     "final_answer_count": final_answer_count,
-                    "schema_version": "drug_agent_sft_v2",
+                    "schema_version": "drug_agent_sft_action_json_legacy_v1",
+                    "protocol": "action_json",
+                    "source_protocol": "legacy_action_json_converter",
                 },
             }
             out_rows[task_type].append(row)
@@ -444,6 +485,8 @@ def main() -> int:
         "usage_summary_csv": str(usage_summary_csv),
         "allowlist": str(args.allowlist),
         "allow_all": bool(args.allow_all),
+        "output_protocol": "action_json",
+        "schema_version": "drug_agent_sft_action_json_legacy_v1",
         "max_samples_per_task_type": args.max_samples_per_task_type,
         "counts": {
             **dict(counters),

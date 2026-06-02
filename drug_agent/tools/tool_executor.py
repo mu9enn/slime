@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from drug_agent.tools.mcp_client import MCPClient
+from drug_agent.tools.tool_success import evaluate_tool_success
 from drug_agent.utils import to_jsonable
 
 
@@ -34,6 +35,10 @@ class MCPToolExecutor:
         self._thread.start()
         self._ready.wait(timeout=2.0)
         self._closed = False
+        self.unknown_semantic_as_failure = self._resolve_bool_env(
+            "DRUG_AGENT_UNKNOWN_SEMANTIC_AS_FAILURE",
+            default=True,
+        )
 
         if connect_on_init:
             self._run(self._client.connect(), timeout=self._timeout_for("connect"), label="connect")
@@ -86,13 +91,25 @@ class MCPToolExecutor:
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         started = time.monotonic()
         if not isinstance(arguments, dict):
+            tool_success = evaluate_tool_success(
+                transport_ok=False,
+                tool_schema_valid=False,
+                parsed_payload=None,
+                raw_payload=None,
+                unknown_as_failure=self.unknown_semantic_as_failure,
+            )
             return {
                 "ok": False,
                 "tool_name": tool_name,
                 "result": None,
                 "error": {"type": "ToolExecutionError", "message": "`arguments` must be an object"},
                 "latency_sec": 0.0,
-                "metadata": {},
+                "transport_ok": tool_success["transport_ok"],
+                "tool_schema_valid": tool_success["tool_schema_valid"],
+                "tool_execution_success": tool_success["tool_execution_success"],
+                "tool_semantic_success": tool_success["tool_semantic_success"],
+                "semantic_unknown": tool_success["semantic_unknown"],
+                "metadata": {"tool_success": tool_success},
             }
 
         self._ensure_connected()
@@ -102,22 +119,58 @@ class MCPToolExecutor:
                 timeout=self._timeout_for("execute"),
                 label=f"call_tool:{tool_name}",
             )
+            parsed_payload = to_jsonable(raw.get("parsed"))
+            raw_payload = to_jsonable(raw.get("raw"))
+            tool_success = evaluate_tool_success(
+                transport_ok=True,
+                tool_schema_valid=True,
+                parsed_payload=parsed_payload,
+                raw_payload=raw_payload,
+                unknown_as_failure=self.unknown_semantic_as_failure,
+            )
+            ok = bool(tool_success["tool_semantic_success"])
+            error = None
+            if not ok:
+                error = {
+                    "type": tool_success.get("semantic_error_type") or "ToolExecutionError",
+                    "message": tool_success.get("semantic_error_message") or "tool execution failed",
+                }
             return {
-                "ok": True,
+                "ok": ok,
                 "tool_name": tool_name,
-                "result": to_jsonable(raw.get("parsed")),
-                "error": None,
+                "result": parsed_payload,
+                "error": error,
                 "latency_sec": round(time.monotonic() - started, 6),
-                "metadata": {"raw": to_jsonable(raw.get("raw"))},
+                "transport_ok": tool_success["transport_ok"],
+                "tool_schema_valid": tool_success["tool_schema_valid"],
+                "tool_execution_success": tool_success["tool_execution_success"],
+                "tool_semantic_success": tool_success["tool_semantic_success"],
+                "semantic_unknown": tool_success["semantic_unknown"],
+                "metadata": {
+                    "raw": raw_payload,
+                    "tool_success": tool_success,
+                },
             }
         except Exception as exc:
+            tool_success = evaluate_tool_success(
+                transport_ok=False,
+                tool_schema_valid=True,
+                parsed_payload=None,
+                raw_payload=None,
+                unknown_as_failure=self.unknown_semantic_as_failure,
+            )
             return {
                 "ok": False,
                 "tool_name": tool_name,
                 "result": None,
                 "error": {"type": "ToolExecutionError", "message": str(exc)},
                 "latency_sec": round(time.monotonic() - started, 6),
-                "metadata": {},
+                "transport_ok": tool_success["transport_ok"],
+                "tool_schema_valid": tool_success["tool_schema_valid"],
+                "tool_execution_success": tool_success["tool_execution_success"],
+                "tool_semantic_success": tool_success["tool_semantic_success"],
+                "semantic_unknown": tool_success["semantic_unknown"],
+                "metadata": {"tool_success": tool_success},
             }
 
     def close(self) -> None:
@@ -156,6 +209,13 @@ class MCPToolExecutor:
         if stage == "execute" and self.execute_timeout is not None:
             return self.execute_timeout
         return self.request_timeout
+
+    @staticmethod
+    def _resolve_bool_env(env_key: str, default: bool) -> bool:
+        raw = os.environ.get(env_key)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
     def _normalize_tool_list(raw_tools: Any) -> list[dict[str, Any]]:

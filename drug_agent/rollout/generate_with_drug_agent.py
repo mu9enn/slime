@@ -10,21 +10,18 @@ from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
-from drug_agent.protocol.action_parser import parse_action
+from drug_agent.protocol.parse_policy import (
+    parse_action_with_policy,
+    resolve_rollout_controls,
+)
 from drug_agent.protocol.action_schema import ACTION_FINAL_ANSWER, ACTION_TOOL_CALL
 from drug_agent.tools.tool_executor import MCPToolExecutor
 from drug_agent.tools.tool_registry import ToolRegistry
+from drug_agent.tools.tool_success import make_validation_failed_result
 from drug_agent.utils import normalize_tool_name, to_jsonable
 
 _RUNTIME_LOCK = threading.Lock()
 _RUNTIME: dict[str, Any] | None = None
-
-ROLLOUT_MODE_TRAIN_STRICT = "train_strict"
-ROLLOUT_MODE_DEBUG_PERMISSIVE = "debug_permissive"
-SUPPORTED_ROLLOUT_MODES = {
-    ROLLOUT_MODE_TRAIN_STRICT,
-    ROLLOUT_MODE_DEBUG_PERMISSIVE,
-}
 
 ROLLOUT_FORMAT_REMINDER = (
     "/no_think\n"
@@ -33,28 +30,6 @@ ROLLOUT_FORMAT_REMINDER = (
     '{"type":"tool_call","tool_name":"...","arguments":{...}} OR '
     '{"type":"final_answer","answer":{"summary":"...","evidence":[],"result":{},"ranked_molecules":[]}}'
 )
-
-
-def _bool_from_env(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _resolve_rollout_controls() -> dict[str, Any]:
-    requested_mode = os.environ.get("DRUG_AGENT_ROLLOUT_MODE", ROLLOUT_MODE_TRAIN_STRICT)
-    mode = requested_mode.strip().lower() if isinstance(requested_mode, str) else ROLLOUT_MODE_TRAIN_STRICT
-    if mode not in SUPPORTED_ROLLOUT_MODES:
-        mode = ROLLOUT_MODE_TRAIN_STRICT
-
-    allow_parse_recovery_override = _bool_from_env("DRUG_AGENT_ALLOW_PARSE_RECOVERY", default=False)
-    parse_recovery_enabled = mode == ROLLOUT_MODE_DEBUG_PERMISSIVE or allow_parse_recovery_override
-    return {
-        "rollout_mode": mode,
-        "allow_parse_recovery_override": allow_parse_recovery_override,
-        "parse_recovery_enabled": parse_recovery_enabled,
-    }
 
 
 def _get_runtime() -> dict[str, Any]:
@@ -150,50 +125,6 @@ def _append_observation(
     rollout_log_probs.extend([0.0] * len(obs_token_ids))
 
 
-def _extract_json_object_candidate(text: str) -> str | None:
-    if not isinstance(text, str):
-        return None
-    decoder = json.JSONDecoder()
-    candidates: list[tuple[int, int, str]] = []
-    for start, ch in enumerate(text):
-        if ch != "{":
-            continue
-        snippet = text[start:]
-        try:
-            obj, end = decoder.raw_decode(snippet)
-        except Exception:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        candidate = snippet[:end]
-        tail = snippet[end:].strip()
-        score = 0
-        if "type" in obj:
-            score += 10
-        if tail == "":
-            score += 3
-        if isinstance(obj.get("type"), str):
-            score += 2
-        candidates.append((score, -start, candidate))
-    if not candidates:
-        return None
-    candidates.sort(reverse=True)
-    return candidates[0][2]
-
-
-def _parse_action_with_optional_recovery(raw_response: str, *, enable_parse_recovery: bool):
-    parsed = parse_action(raw_response)
-    if parsed.ok:
-        return parsed, None, raw_response, "strict"
-    if enable_parse_recovery:
-        candidate = _extract_json_object_candidate(raw_response)
-        if candidate and candidate.strip() != raw_response.strip():
-            repaired = parse_action(candidate)
-            if repaired.ok:
-                return repaired, {"recovered": True, "strategy": "extract_embedded_json_object"}, candidate, "recovered"
-    return parsed, None, raw_response, "strict"
-
-
 async def _execute_tool(
     executor: MCPToolExecutor,
     tool_name: str,
@@ -216,7 +147,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     data_source = context["data_source"]
     allowed_tools = context["allowed_tools"]
     max_steps = context["max_steps"]
-    rollout_controls = _resolve_rollout_controls()
+    rollout_controls = resolve_rollout_controls()
     rollout_mode = rollout_controls["rollout_mode"]
     parse_recovery_enabled = bool(rollout_controls["parse_recovery_enabled"])
     allow_parse_recovery_override = bool(rollout_controls["allow_parse_recovery_override"])
@@ -240,6 +171,11 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     num_invalid = 0
     num_tool_success = 0
     num_tool_error = 0
+    num_tool_schema_error = 0
+    num_tool_execution_success = 0
+    num_tool_semantic_error = 0
+    num_tool_semantic_unknown = 0
+    num_transport_error = 0
     num_parse_recovery = 0
     strict_valid_count = 0
     recovered_valid_count = 0
@@ -296,9 +232,9 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 actions.append(action_record)
                 break
 
-            parsed, parse_recovery, normalized_response, parse_source = _parse_action_with_optional_recovery(
+            parsed, parse_recovery, normalized_response, parse_source = parse_action_with_policy(
                 cur_response,
-                enable_parse_recovery=parse_recovery_enabled,
+                parse_recovery_enabled=parse_recovery_enabled,
             )
             action_record["parsed"] = parsed.to_dict()
             action_record["model_output"] = normalized_response
@@ -341,25 +277,32 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                     tool_result = await _execute_tool(executor, tool_name, tool_args)
                 else:
                     err_message = tool_reason or args_reason or "tool validation failed"
-                    tool_result = {
-                        "ok": False,
-                        "tool_name": tool_name,
-                        "result": None,
-                        "error": {
-                            "type": "ToolValidationError",
-                            "message": err_message,
-                        },
-                        "latency_sec": 0.0,
-                        "metadata": {
-                            "tool_reason": tool_reason,
-                            "args_reason": args_reason,
-                        },
-                    }
+                    tool_result = make_validation_failed_result(
+                        tool_name=tool_name,
+                        message=err_message,
+                        tool_reason=tool_reason,
+                        args_reason=args_reason,
+                    )
 
-                if tool_result.get("ok"):
+                transport_ok = bool(tool_result.get("transport_ok"))
+                tool_schema_valid = bool(tool_result.get("tool_schema_valid"))
+                tool_execution_success = bool(tool_result.get("tool_execution_success"))
+                tool_semantic_success = bool(tool_result.get("tool_semantic_success"))
+                semantic_unknown = bool(tool_result.get("semantic_unknown"))
+
+                if not tool_schema_valid:
+                    num_tool_schema_error += 1
+                if not transport_ok:
+                    num_transport_error += 1
+                if tool_execution_success:
+                    num_tool_execution_success += 1
+                if tool_semantic_success:
                     num_tool_success += 1
                 else:
                     num_tool_error += 1
+                    num_tool_semantic_error += 1
+                if semantic_unknown:
+                    num_tool_semantic_unknown += 1
 
                 obs_payload = {
                     "type": "tool_result",
@@ -368,6 +311,11 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                     "result": to_jsonable(tool_result.get("result")),
                     "error": to_jsonable(tool_result.get("error")),
                     "latency_sec": tool_result.get("latency_sec"),
+                    "transport_ok": transport_ok,
+                    "tool_schema_valid": tool_schema_valid,
+                    "tool_execution_success": tool_execution_success,
+                    "tool_semantic_success": tool_semantic_success,
+                    "semantic_unknown": semantic_unknown,
                     "metadata": to_jsonable(tool_result.get("metadata")),
                 }
                 observations.append({"step": step, **obs_payload})
@@ -418,7 +366,9 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     strict_success_rate = strict_valid_count / max(1, num_steps)
     recovery_success_rate = recovered_valid_count / max(1, num_steps)
     total_tool_calls = num_tool_success + num_tool_error
+    execution_attempt_count = total_tool_calls - num_tool_schema_error
     tool_success_rate = num_tool_success / max(1, total_tool_calls)
+    tool_execution_success_rate = num_tool_execution_success / max(1, execution_attempt_count)
 
     trace = {
         "task_id": task_id,
@@ -441,12 +391,18 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         "recovered_valid_count": recovered_valid_count,
         "num_tool_success": num_tool_success,
         "num_tool_error": num_tool_error,
+        "num_tool_schema_error": num_tool_schema_error,
+        "num_tool_execution_success": num_tool_execution_success,
+        "num_tool_semantic_error": num_tool_semantic_error,
+        "num_tool_semantic_unknown": num_tool_semantic_unknown,
+        "num_transport_error": num_transport_error,
         "truncated": sample.status == Sample.Status.TRUNCATED,
         "error": fatal_error,
         "action_valid_rate": action_valid_rate,
         "strict_success_rate": strict_success_rate,
         "recovery_success_rate": recovery_success_rate,
         "tool_success_rate": tool_success_rate,
+        "tool_execution_success_rate": tool_execution_success_rate,
     }
     sample.metadata["drug_agent_trace"] = trace
 

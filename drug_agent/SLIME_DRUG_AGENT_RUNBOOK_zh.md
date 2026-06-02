@@ -11,6 +11,15 @@
 - 训练默认使用严格 rollout：
   - `DRUG_AGENT_ROLLOUT_MODE=train_strict`
   - `DRUG_AGENT_ALLOW_PARSE_RECOVERY=0`
+- SFT 侧现在切到 ReAct-style tagged messages：
+  - `<thought>...</thought>`
+  - `<tool_call>...</tool_call>`
+  - `<observation tool_name="...">...</observation>`
+  - `<final_answer>...</final_answer>`
+- SFT 校验建议使用：
+  - `python drug_agent/data/validate_sft_messages.py --protocol react_json ...`
+- 工具语义默认保守策略：
+  - `DRUG_AGENT_UNKNOWN_SEMANTIC_AS_FAILURE=1`
 - `debug_one_task.py` 允许宽松恢复，仅用于门禁/诊断，不用于训练 reward。
 - 可先设置：
 
@@ -58,6 +67,9 @@ drug_agent/
 - `protocol/action_parser.py`
   - 严格 JSON 协议
   - 拒绝 markdown fenced JSON / XML / 包裹文本
+- `protocol/parse_policy.py`
+  - 统一 strict/permissive 解析策略
+  - rollout/debug 复用同一解析逻辑
 - `data/inspect_pipelined_data.py`
   - 扫描 `ac/pf/vs`
   - 输出 schema report + join 覆盖统计
@@ -65,10 +77,11 @@ drug_agent/
   - Hybrid 联表（raw + sft_outputs_answer_hit + usage_summary）
   - 输出 `grpo/ac,pf,vs,mixed.jsonl` + `skipped_report.jsonl`
 - `data/convert_pipelined_to_slime_sft.py`
-  - answer_hit_only 数据转换
-  - assistant action 归一化为裸 JSON
+  - legacy action-json compatibility only
+  - canonical ReAct SFT 来自上游 `pipeline/postprocess`
 - `tools/*`
   - MCP client / executor / registry
+  - tool success 语义拆分（transport/schema/execution/semantic）
   - allowlist 默认开启
 - `rollout/generate_with_drug_agent.py`
   - slime custom_generate 多轮工具调用循环
@@ -76,7 +89,7 @@ drug_agent/
   - async RM，返回 dict（含 `score` 与组件）
 - `rollout/trajectory_logger.py`
   - 写 `trajectories.jsonl`
-  - 注入 `action_valid_rate/tool_success_rate/final_success_rate`
+  - 注入 strict/recovery 分流和 tool semantic 指标
 
 ## 3. 数据状态（你已复现成功）
 
@@ -145,7 +158,7 @@ export GRPO_SAVE=$RUN_ROOT/ckpt_grpo
 
 ```bash
 NUM_GPUS=2 \
-PROMPT_DATA=$DRUG_AGENT_DATA_ROOT/sft/mixed.jsonl \
+PROMPT_DATA=/root/slime_sxy/group-space/sunxiangyu/slime_wd/data/mcp_sft_all \
 SAVE_DIR=$SFT_SAVE \
 SAVE_INTERVAL=1 \
 DRUG_AGENT_RUN_NAME=${RUN_TAG}_sft \
@@ -156,10 +169,27 @@ bash drug_agent/scripts/run_qwen3_5_0_8b_drug_sft_smoke.sh \
 SFT 前先做数据校验（强烈建议）：
 
 ```bash
+python drug_agent/data/materialize_sft_jsonl.py \
+  --input /root/slime_sxy/group-space/sunxiangyu/slime_wd/data/mcp_sft_all \
+  --output /root/slime_sxy/group-space/sunxiangyu/slime_wd/data/mcp_sft_all.train.jsonl
+
 python drug_agent/data/validate_sft_messages.py \
-  --input $DRUG_AGENT_DATA_ROOT/sft/mixed.jsonl \
+  --protocol react_json \
+  --input /root/slime_sxy/group-space/sunxiangyu/slime_wd/data/mcp_sft_all.train.jsonl
+
+python drug_agent/tools_debug/debug_sft_mask_qwen.py \
+  --input /root/slime_sxy/group-space/sunxiangyu/slime_wd/data/mcp_sft_all.train.jsonl \
   --tokenizer $VERL_DATA/Qwen3.5-0.8B
 ```
+
+如果你还在检查当前仓库里的 legacy `mixed.jsonl` 兼容数据，再显式切到 `--protocol action_json` 或 `--protocol auto`；当前这套新数据目录已经是 ReAct SFT 正式输入。
+
+补充：
+
+- Qwen3.5 ReAct-SFT 必须使用 `--loss-mask-type qwen3_5`
+- 不要使用 slime 默认的 `qwen` loss mask 分支，否则会在多轮 observation 样本上报 `No user query found in messages`
+- 同一个 SFT smoke 入口可以通过 `MODEL_ARGS_FILE=scripts/models/qwen3.5-4B.sh` 或 `MODEL_ARGS_FILE=scripts/models/qwen3.5-27B.sh` 复用到更大模型
+- 如果你在 2GPU worker 上把 smoke 缩到很小，`GLOBAL_BATCH_SIZE` 仍然必须能被 `NUM_GPUS` 整除；例如 `GLOBAL_BATCH_SIZE=2` 可以，`GLOBAL_BATCH_SIZE=1` 会在后续 Megatron 初始化时报 batch divisibility 断言
 
 ### Stage B: PPO smoke（从 SFT 继续）
 
@@ -219,6 +249,8 @@ bash drug_agent/scripts/run_qwen3_5_0_8b_drug_grpo_learn.sh \
   - `strict_success_rate`
   - `recovery_success_rate`
   - `tool_success_rate`
+  - `tool_execution_success_rate`
+  - `tool_semantic_unknown_rate`
   - `final_success_rate`
 
 ## 7. 常见问题与排障
@@ -252,19 +284,59 @@ ls -lh $DRUG_AGENT_DATA_ROOT/sft/mixed.jsonl
 
 ### 7.4 SFT 报错 `No user query found in messages`
 
-这是 Qwen3.5 chat template 的约束触发，不是 CUDA/Ray 崩溃。修复策略已落在 `convert_pipelined_to_slime_sft.py`：  
-1. 非 `system/user/assistant` 角色统一转为 `user`；  
-2. `content` 统一字符串化；  
-3. 保证第一条非 system 消息是 user；  
-4. 如果所有 user 都是 `<tool_response>...</tool_response>`，自动插入一个种子 user query。  
+这不是数据缺 `user` 角色，而是 Qwen3.5 ReAct-SFT 误走了 slime 默认的 `qwen` loss-mask 分支。  
+
+当前正式修复口径是：  
+1. 训练脚本显式使用 `--loss-mask-type qwen3_5`；  
+2. 推荐训练入口固定为 materialized 的 `mcp_sft_all.train.jsonl`；  
+3. 保持 ReAct 文本协议，不向 HF chat template 传 `tools=`；  
+4. 用 `debug_sft_mask_qwen.py` 复现并确认：`qwen` 会失败，`qwen3_5` 会成功。  
 
 修复后必须跑：
 
 ```bash
+python drug_agent/data/materialize_sft_jsonl.py \
+  --input /root/slime_sxy/group-space/sunxiangyu/slime_wd/data/mcp_sft_all \
+  --output /root/slime_sxy/group-space/sunxiangyu/slime_wd/data/mcp_sft_all.train.jsonl
+
 python drug_agent/data/validate_sft_messages.py \
+  --protocol react_json \
+  --input /root/slime_sxy/group-space/sunxiangyu/slime_wd/data/mcp_sft_all.train.jsonl \
+  --tokenizer $VERL_DATA/Qwen3.5-0.8B
+
+python drug_agent/tools_debug/debug_sft_mask_qwen.py \
+  --input /root/slime_sxy/group-space/sunxiangyu/slime_wd/data/mcp_sft_all.train.jsonl \
+  --tokenizer $VERL_DATA/Qwen3.5-0.8B
+```
+
+如果你当前验证的是 legacy `mixed.jsonl`，把这里临时改成 `--protocol auto`；但正式 ReAct-SFT 训练不要再把 legacy `mixed.jsonl` 当主入口。
+
+### 7.5 正式训练合规自检
+
+在不启动训练的情况下做协议级抽检：
+
+```bash
+python drug_agent/tools_debug/debug_training_compliance.py
+```
+
+说明：
+
+- `debug_training_compliance.py` 现在只是 deprecated helper，不再作为权威门禁
+- ReAct SFT 的正式校验请用：
+
+```bash
+python drug_agent/data/validate_sft_messages.py \
+  --protocol react_json \
   --input $DRUG_AGENT_DATA_ROOT/sft/mixed.jsonl \
   --tokenizer $VERL_DATA/Qwen3.5-0.8B
 ```
+
+输出：
+
+- `$VERL_DATA/slime_drug_agent_runs/training_compliance_audit_<timestamp>/audit_report.json`
+- `$VERL_DATA/slime_drug_agent_runs/training_compliance_audit_<timestamp>/audit_report.md`
+
+建议同时关注 validator 的 JSON summary，它才是 ReAct SFT 的正式协议检查结果。
 
 ## 8. 下一步建议
 

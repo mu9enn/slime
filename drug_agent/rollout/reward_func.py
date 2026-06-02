@@ -25,6 +25,11 @@ def _extract_trace(sample: Sample) -> dict[str, Any]:
         "recovered_valid_count": 0,
         "num_tool_success": 0,
         "num_tool_error": 0,
+        "num_tool_schema_error": 0,
+        "num_tool_execution_success": 0,
+        "num_tool_semantic_error": 0,
+        "num_tool_semantic_unknown": 0,
+        "num_transport_error": 0,
         "truncated": sample.status == Sample.Status.TRUNCATED,
         "final_answer": None,
     }
@@ -114,32 +119,62 @@ def _tool_stats(trace: dict[str, Any]) -> dict[str, int]:
     observations = _observations(trace)
     total_tool_results = 0
     schema_fail_count = 0
+    transport_error_count = 0
     execution_attempt_count = 0
     execution_success_count = 0
+    semantic_success_count = 0
+    semantic_error_count = 0
+    semantic_unknown_count = 0
 
     for obs in observations:
         if obs.get("type") != "tool_result":
             continue
         total_tool_results += 1
-        ok = bool(obs.get("ok"))
+        transport_ok = bool(obs.get("transport_ok")) if "transport_ok" in obs else bool(obs.get("ok"))
+        tool_schema_valid = bool(obs.get("tool_schema_valid")) if "tool_schema_valid" in obs else True
+        tool_execution_success = (
+            bool(obs.get("tool_execution_success")) if "tool_execution_success" in obs else bool(obs.get("ok"))
+        )
+        tool_semantic_success = (
+            bool(obs.get("tool_semantic_success")) if "tool_semantic_success" in obs else bool(obs.get("ok"))
+        )
+        semantic_unknown = bool(obs.get("semantic_unknown"))
         error = obs.get("error") if isinstance(obs.get("error"), dict) else {}
         metadata = obs.get("metadata") if isinstance(obs.get("metadata"), dict) else {}
         tool_reason = metadata.get("tool_reason")
         args_reason = metadata.get("args_reason")
-        is_schema_fail = bool(tool_reason) or bool(args_reason) or error.get("type") == "ToolValidationError"
+        is_schema_fail = (not tool_schema_valid) or bool(tool_reason) or bool(args_reason) or error.get(
+            "type"
+        ) == "ToolValidationError"
         if is_schema_fail:
             schema_fail_count += 1
+            semantic_error_count += 1
+            continue
+
+        if not transport_ok:
+            transport_error_count += 1
+            semantic_error_count += 1
             continue
 
         execution_attempt_count += 1
-        if ok:
+        if tool_execution_success:
             execution_success_count += 1
+        if tool_semantic_success:
+            semantic_success_count += 1
+        else:
+            semantic_error_count += 1
+        if semantic_unknown:
+            semantic_unknown_count += 1
 
     return {
         "total_tool_results": total_tool_results,
         "schema_fail_count": schema_fail_count,
+        "transport_error_count": transport_error_count,
         "execution_attempt_count": execution_attempt_count,
         "execution_success_count": execution_success_count,
+        "semantic_success_count": semantic_success_count,
+        "semantic_error_count": semantic_error_count,
+        "semantic_unknown_count": semantic_unknown_count,
     }
 
 
@@ -176,12 +211,27 @@ def _compute_tool_schema_reward(tool_stats: dict[str, int]) -> float:
 def _compute_tool_execution_reward(tool_stats: dict[str, int]) -> float:
     execution_attempt_count = int(tool_stats.get("execution_attempt_count") or 0)
     execution_success_count = int(tool_stats.get("execution_success_count") or 0)
+    transport_error_count = int(tool_stats.get("transport_error_count") or 0)
     if execution_attempt_count <= 0:
         return -0.05
 
     success_ratio = execution_success_count / execution_attempt_count
-    reward = success_ratio * 0.2 - (1.0 - success_ratio) * 0.1
+    transport_penalty = min(0.15, 0.03 * transport_error_count)
+    reward = success_ratio * 0.2 - (1.0 - success_ratio) * 0.1 - transport_penalty
     return clamp(reward, -0.2, 0.2)
+
+
+def _compute_tool_semantic_reward(tool_stats: dict[str, int]) -> float:
+    execution_attempt_count = int(tool_stats.get("execution_attempt_count") or 0)
+    semantic_success_count = int(tool_stats.get("semantic_success_count") or 0)
+    semantic_unknown_count = int(tool_stats.get("semantic_unknown_count") or 0)
+    if execution_attempt_count <= 0:
+        return -0.05
+
+    success_ratio = semantic_success_count / execution_attempt_count
+    unknown_penalty = min(0.2, 0.04 * semantic_unknown_count)
+    reward = success_ratio * 0.25 - (1.0 - success_ratio) * 0.15 - unknown_penalty
+    return clamp(reward, -0.35, 0.25)
 
 
 def _compute_parse_recovery_penalty(action_stats: dict[str, int]) -> float:
@@ -276,18 +326,22 @@ async def _reward_one(args, sample: Sample, **kwargs) -> dict[str, Any]:
         "action_valid_reward": _compute_action_valid_reward(action_stats),
         "tool_schema_reward": _compute_tool_schema_reward(tool_stats),
         "tool_execution_reward": _compute_tool_execution_reward(tool_stats),
+        "tool_semantic_reward": _compute_tool_semantic_reward(tool_stats),
         "parse_recovery_penalty": _compute_parse_recovery_penalty(action_stats),
         "progress_reward": _compute_progress_reward(trace),
         "final_reward": _compute_final_reward(trace, label),
         "efficiency_reward": _compute_efficiency_reward(trace, max_steps=max_steps),
     }
-    components["tool_reward"] = components["tool_schema_reward"] + components["tool_execution_reward"]
+    components["tool_reward"] = (
+        components["tool_schema_reward"] + components["tool_execution_reward"] + components["tool_semantic_reward"]
+    )
 
     score = (
         components["format_reward"]
         + components["action_valid_reward"]
         + components["tool_schema_reward"]
         + components["tool_execution_reward"]
+        + components["tool_semantic_reward"]
         + components["parse_recovery_penalty"]
         + components["progress_reward"]
         + components["final_reward"]
@@ -302,10 +356,27 @@ async def _reward_one(args, sample: Sample, **kwargs) -> dict[str, Any]:
         "strict_valid_count": int(action_stats.get("strict_valid_count") or 0),
         "recovered_valid_count": int(action_stats.get("recovered_valid_count") or 0),
         "tool_schema_fail_count": int(tool_stats.get("schema_fail_count") or 0),
+        "tool_transport_error_count": int(tool_stats.get("transport_error_count") or 0),
         "tool_execution_attempt_count": int(tool_stats.get("execution_attempt_count") or 0),
         "tool_execution_success_count": int(tool_stats.get("execution_success_count") or 0),
+        "tool_semantic_success_count": int(tool_stats.get("semantic_success_count") or 0),
+        "tool_semantic_error_count": int(tool_stats.get("semantic_error_count") or 0),
+        "tool_semantic_unknown_count": int(tool_stats.get("semantic_unknown_count") or 0),
         "num_tool_success": int(trace.get("num_tool_success") or 0),
         "num_tool_error": int(trace.get("num_tool_error") or 0),
+        "num_tool_schema_error": int(trace.get("num_tool_schema_error") or tool_stats.get("schema_fail_count") or 0),
+        "num_tool_execution_success": int(
+            trace.get("num_tool_execution_success") or tool_stats.get("execution_success_count") or 0
+        ),
+        "num_tool_semantic_error": int(
+            trace.get("num_tool_semantic_error") or tool_stats.get("semantic_error_count") or 0
+        ),
+        "num_tool_semantic_unknown": int(
+            trace.get("num_tool_semantic_unknown") or tool_stats.get("semantic_unknown_count") or 0
+        ),
+        "num_transport_error": int(trace.get("num_transport_error") or tool_stats.get("transport_error_count") or 0),
+        "num_final_answer": 1 if isinstance(trace.get("final_answer"), dict) else 0,
+        "num_max_steps": 1 if trace.get("done_reason") == "max_steps" else 0,
         "done_reason": trace.get("done_reason"),
         "rollout_mode": trace.get("rollout_mode"),
         "parse_recovery_enabled": bool(trace.get("parse_recovery_enabled")),
