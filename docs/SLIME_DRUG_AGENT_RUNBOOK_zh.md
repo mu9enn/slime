@@ -21,6 +21,7 @@
 - 工具语义默认保守策略：
   - `DRUG_AGENT_UNKNOWN_SEMANTIC_AS_FAILURE=1`
 - `debug_one_task.py` 允许宽松恢复，仅用于门禁/诊断，不用于训练 reward。
+- smoke 脚本会做一个前置保护：如果你给的 `NUM_ROLLOUT / ROLLOUT_BATCH_SIZE / GLOBAL_BATCH_SIZE` 组合会让 `train_iters=0`，脚本会自动把 `LR_DECAY_ITERS` 提到 `1`，避免 Megatron 在 scheduler 初始化时直接断言失败。
 - 可先设置：
 
 ```bash
@@ -90,6 +91,12 @@ drug_agent/
 - `rollout/trajectory_logger.py`
   - 写 `trajectories.jsonl`
   - 注入 strict/recovery 分流和 tool semantic 指标
+- `toolrl/convert_react_to_toolrl_steps.py`
+  - 将清洗后的 ReAct 轨迹切成 step-level ToolRL 样本
+  - 每个 assistant tool-call turn 生成一条样本
+- `toolrl/molclaw_reward.py`
+  - step-level ToolRL reward
+  - 使用 `--reward-key score`
 
 ## 3. 数据状态（你已复现成功）
 
@@ -108,6 +115,30 @@ drug_agent/
 - SFT：先让模型稳定学会 action 协议与多轮格式
 - PPO：在已有行为基础上做在线策略优化（较稳）
 - GRPO：再切换到 group-based 优势估计做强化
+
+## 4.3 ToolRL step-level 分支
+
+ToolRL 是一条和 SFT / PPO / GRPO 并行的“step-level 工具调用奖励”分支，适合先把模型对 MolClaw tool call 的选择与参数生成对齐。
+
+### 输入与输出
+
+- 输入：`/home/sunxiangyu/slime_sxy/group-space/sunxiangyu/slime_wd/data/mcp_sft_all`
+- 转换脚本：`python drug_agent/toolrl/convert_react_to_toolrl_steps.py`
+- 输出：step-level JSONL，字段包括 `prompt / label / metadata / target_assistant / target_tool_calls`
+- reward hook：`drug_agent.toolrl.molclaw_reward.reward_func`
+
+### 训练入口
+
+- `drug_agent/toolrl/scripts/run_toolrl_grpo_smoke.sh`
+- `drug_agent/toolrl/scripts/run_toolrl_grpo_learn.sh`
+- `drug_agent/toolrl/scripts/run_toolrl_grpo.sh`
+
+### 说明
+
+- ToolRL 仍然走 slime native `train.py`
+- 不改 slime core / trainer
+- 不新增在线 tool-execution generator
+- `--reward-key score` 必须配套使用
 
 ## 4.2 脚本增强（本次已更新）
 

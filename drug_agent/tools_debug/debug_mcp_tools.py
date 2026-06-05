@@ -13,6 +13,7 @@ if __package__ is None or __package__ == "":
 
 from drug_agent.tools.tool_executor import MCPToolExecutor
 from drug_agent.tools.tool_registry import ToolRegistry, load_allowlist
+from drug_agent.offline_guard import assert_tool_environment_allowed
 
 REQUIRED_ENV_KEYS = (
     "MOLCLAW_SCP_SERVER_URL",
@@ -63,6 +64,8 @@ def main() -> int:
     parser.add_argument("--allowlist", type=str, default=str(Path(__file__).resolve().parents[1] / "tools/allowlist_v0.json"))
     parser.add_argument("--allow-all", action="store_true")
     args = parser.parse_args()
+    assert_tool_environment_allowed("debug_mcp_tools online tool execution")
+    print("[ONLINE TOOL DEBUG] Real MolClaw/MCP calls are enabled.", flush=True)
 
     started = time.monotonic()
     output = _base_output(started)

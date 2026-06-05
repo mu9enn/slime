@@ -7,6 +7,7 @@ import threading
 import time
 from typing import Any
 
+from drug_agent.offline_guard import assert_tool_environment_allowed
 from drug_agent.tools.mcp_client import MCPClient
 from drug_agent.tools.tool_success import evaluate_tool_success
 from drug_agent.utils import to_jsonable
@@ -22,6 +23,7 @@ class MCPToolExecutor:
         execute_timeout: float | None = None,
         initialize_timeout: float = 30.0,
     ) -> None:
+        assert_tool_environment_allowed("MCPToolExecutor initialization")
         self.request_timeout = self._resolve_timeout(request_timeout, "MOLCLAW_REQUEST_TIMEOUT_SEC")
         self.connect_timeout = self._resolve_timeout(connect_timeout, "MOLCLAW_CONNECT_TIMEOUT_SEC")
         self.list_tools_timeout = self._resolve_timeout(list_tools_timeout, "MOLCLAW_LIST_TOOLS_TIMEOUT_SEC")

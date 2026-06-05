@@ -5,6 +5,7 @@ import json
 import os
 from typing import Any
 
+from drug_agent.offline_guard import assert_tool_environment_allowed
 from drug_agent.utils import to_jsonable
 
 
@@ -29,6 +30,7 @@ class MCPClient:
         return self._connected and self._session is not None
 
     async def connect(self) -> bool:
+        assert_tool_environment_allowed("MCP client connection")
         if self.connected:
             return True
         if not self.server_url:

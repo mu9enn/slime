@@ -15,6 +15,7 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from drug_agent.constants import VERL_DATA
+from drug_agent.offline_guard import assert_tool_environment_allowed
 from drug_agent.protocol.parse_policy import parse_action_with_policy
 from drug_agent.protocol.action_schema import ACTION_FINAL_ANSWER, ACTION_TOOL_CALL
 from drug_agent.tools.tool_executor import MCPToolExecutor
@@ -292,6 +293,9 @@ def main() -> int:
     parser.add_argument("--mem-fraction-static", type=float, default=0.80)
     parser.add_argument("--health-timeout-sec", type=float, default=300.0)
     args = parser.parse_args()
+    if not args.disable_tool_call:
+        assert_tool_environment_allowed("debug_one_task online tool execution")
+        print("[ONLINE TOOL DEBUG] Real MolClaw/MCP calls are enabled.", flush=True)
 
     started = time.monotonic()
     output: dict[str, Any] = {

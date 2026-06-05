@@ -12,6 +12,7 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from drug_agent.constants import VERL_DATA
+from drug_agent.offline_guard import assert_tool_environment_allowed
 from drug_agent.protocol.action_parser import parse_action
 from drug_agent.protocol.action_schema import ACTION_TOOL_CALL
 from drug_agent.tools.tool_executor import MCPToolExecutor
@@ -110,6 +111,8 @@ def main() -> int:
     )
     parser.add_argument("--allow-all", action="store_true")
     args = parser.parse_args()
+    assert_tool_environment_allowed("debug_replay_trajectory online tool execution")
+    print("[ONLINE TOOL DEBUG] Replaying actions against real MolClaw/MCP tools.", flush=True)
 
     started = time.monotonic()
     output: dict[str, Any] = {

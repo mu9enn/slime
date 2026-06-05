@@ -16,6 +16,8 @@ This directory is a thin plugin layer for migrating MolClaw drug-agent training 
 - Use slime-native hooks: `--custom-generate-function-path`, `--custom-rm-path`, and `--custom-rollout-log-function-path`.
 - Keep all new logic under `$SLIME/drug_agent`.
 - Do not port verl-agent trainer/EnvManager/VectorEnv adapters.
+- Formal training is offline-state only. Current-policy rollout samples a next action but never
+  executes it. See [`OFFLINE_TRAINING_POLICY.md`](OFFLINE_TRAINING_POLICY.md).
 
 ## Directory Layout
 
@@ -31,7 +33,13 @@ drug_agent/
     inspect_pipelined_data.py
     convert_pipelined_to_slime_grpo.py
     convert_pipelined_to_slime_sft.py
-    common.py
+  toolrl/
+    convert_react_to_toolrl_steps.py
+    normalization.py
+    parse_tool_calls.py
+    molclaw_reward.py
+    tool_schema_config.yaml
+  common.py
   tools/
     mcp_client.py
     tool_executor.py
@@ -73,7 +81,25 @@ Quick check:
 bash drug_agent/scripts/check_env.sh
 ```
 
-MCP environment variables (never hardcode API key in code/data):
+## Prepare Qwen3.5-4B torch_dist
+
+The SFT and ToolRL runs for Qwen3.5-4B expect a Megatron `torch_dist` checkpoint at:
+
+```bash
+$VERL_DATA/Qwen3.5-4B_torch_dist
+```
+
+If that directory does not exist yet, prepare it with:
+
+```bash
+bash drug_agent/scripts/prepare_qwen3_5_4B_torch_dist.sh
+```
+
+You can override the input/output paths and GPU count with environment variables such as
+`HF_CHECKPOINT`, `SAVE_DIR`, `NUM_GPUS`, and `MEGATRON_LM_PATH`.
+
+MCP environment variables are only for explicitly opted-in online evaluation/debug; formal training
+removes them and never requires them:
 
 - `MOLCLAW_SCP_SERVER_URL`
 - `MOLCLAW_SCP_API_KEY`
@@ -89,6 +115,8 @@ Optional plugin controls:
 - `DRUG_AGENT_ROLLOUT_MODE` (default: `train_strict`; optional `debug_permissive`)
 - `DRUG_AGENT_ALLOW_PARSE_RECOVERY` (default: `0`; set `1` only for diagnostics)
 - `DRUG_AGENT_UNKNOWN_SEMANTIC_AS_FAILURE` (default: `1`)
+- `DRUG_AGENT_TRAINING_OFFLINE` (`1` in every formal training entry)
+- `DRUG_AGENT_ALLOW_TOOL_ENV` (default denied; set `1` only for named online evaluation/debug)
 - `DRUG_AGENT_RUN_NAME`
 - `OUTPUTS_ROOT` (default: `$WD/outputs`)
 - `DRUG_AGENT_DATA_ROOT` (default: `$OUTPUTS_ROOT/slime_drug_agent_data`)
@@ -148,11 +176,52 @@ Note:
 - This converter is legacy compatibility only and still emits action-json SFT.
 - Canonical ReAct-style SFT now comes from the upstream `pipeline/postprocess` path.
 
+### 4) Convert ToolRL step-level data
+
+ToolRL consumes cleaned ReAct trajectories and splits them into one sample per MolClaw tool-calling assistant turn:
+
+```bash
+python drug_agent/toolrl/convert_react_to_toolrl_steps.py \
+  --input /home/sunxiangyu/slime_sxy/group-space/sunxiangyu/slime_wd/data/mcp_sft_all \
+  --output /tmp/toolrl_steps.jsonl \
+  --skipped-report /tmp/toolrl_skipped.jsonl \
+  --report /tmp/toolrl_report.json
+```
+
+The output rows contain:
+
+- `prompt`
+- `label`
+- `metadata`
+- `target_assistant`
+- `target_tool_calls`
+
+The custom reward hook is:
+
+- `drug_agent.toolrl.molclaw_reward.reward_func`
+
+ToolRL training scripts live under:
+
+- `drug_agent/toolrl/scripts/run_toolrl_grpo_smoke.sh`
+- `drug_agent/toolrl/scripts/run_toolrl_grpo_learn.sh`
+- `drug_agent/toolrl/scripts/run_toolrl_grpo.sh`
+
+ToolRL is offline by design. It uses slime's native single-response rollout and the custom reward hook
+`drug_agent.toolrl.molclaw_reward.reward_func`; it does not call MCP or MolClaw tools during training.
+Use these checks before launching a ToolRL run:
+
+```bash
+python drug_agent/toolrl/validate_toolrl_offline_data.py \
+  --input $VERL_DATA/slime_drug_agent_data/toolrl/mcp_sft_all.toolrl_steps.jsonl
+
+python drug_agent/tools_debug/debug_toolrl_offline_no_tool_call.py
+```
+
 ## Protocol
 
-### RL / online rollout protocol
+### Legacy action-json online-agent protocol
 
-The online training stack in this repo still uses action-json for rollout:
+The historical online-agent implementation uses action-json for rollout:
 
 - one assistant turn contains one strict JSON object
 - supported actions are `tool_call` and `final_answer`
@@ -222,23 +291,8 @@ This helper is deprecated and informational only. It is no longer the training a
 
 ## Train Entrypoints
 
-GRPO smoke:
-
-```bash
-bash drug_agent/scripts/run_qwen3_5_0_8b_drug_grpo_smoke.sh
-```
-
-GRPO learn:
-
-```bash
-bash drug_agent/scripts/run_qwen3_5_0_8b_drug_grpo_learn.sh
-```
-
-PPO smoke (slime native PPO):
-
-```bash
-bash drug_agent/scripts/run_qwen3_5_0_8b_drug_ppo_smoke.sh
-```
+The old action-json GRPO/PPO scripts executed tools during training and are now disabled before Ray
+starts. Formal RL training uses the offline ToolRL-style or step-level GAD scripts.
 
 SFT smoke (slime native SFT: `sft_rollout + sft_loss`):
 
@@ -252,7 +306,52 @@ For Qwen3.5 ReAct-SFT, the script explicitly uses `--loss-mask-type qwen3_5`. Us
 
 The same SFT script can be reused across model sizes by overriding `MODEL_ARGS_FILE`, for example `scripts/models/qwen3.5-4B.sh` or `scripts/models/qwen3.5-27B.sh`.
 
-When shrinking the smoke on a 2-GPU worker, keep `GLOBAL_BATCH_SIZE` divisible by `NUM_GPUS`. For example, `GLOBAL_BATCH_SIZE=2` is valid on 2 GPUs, while `GLOBAL_BATCH_SIZE=1` will fail later in Megatron with a batch divisibility assertion.
+SFT batch and parallel settings must satisfy:
+
+- `ROLLOUT_BATCH_SIZE >= GLOBAL_BATCH_SIZE`
+- `ROLLOUT_BATCH_SIZE % GLOBAL_BATCH_SIZE == 0`
+- `NUM_GPUS % (TP * PP * CP * EP) == 0`
+- `GLOBAL_BATCH_SIZE % DATA_PARALLEL_SIZE == 0`
+- For the current dense Qwen setup, `DATA_PARALLEL_SIZE = NUM_GPUS / (TP * PP * CP * EP)`.
+
+`MAX_TOKENS_PER_GPU` is a dynamic microbatch packing budget. It does not truncate an individual
+sample that is longer than the budget. The current ReAct SFT data contains samples around 10k
+tokens, so larger models may require tensor parallelism to shard the vocabulary logits and their
+temporary copies.
+
+For Qwen3.5-4B on four GPUs, use the dedicated conservative smoke entrypoint:
+
+```bash
+bash drug_agent/scripts/run_qwen3_5_4b_drug_sft_smoke.sh
+```
+
+It defaults to `TP=4`, `DP=1`, and `ROLLOUT_BATCH_SIZE=GLOBAL_BATCH_SIZE=1`. This is intentionally
+more conservative than `TP=2`: the observed TP=1 failure occurred while cloning full-vocabulary
+logits for an approximately 10k-token sample, not because of Ray scheduling or host memory.
+
+Do not enable `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` or
+`PYTORCH_ALLOC_CONF=expandable_segments:True` on this colocated SGLang + Megatron path.
+SGLang uses `TorchMemorySaver`, which currently rejects expandable allocator segments. The SFT
+entrypoint removes inherited incompatible values before starting Ray and does not inject them into
+the Ray runtime environment.
+
+After smoke passes, launch a complete one-epoch 4B SFT run with:
+
+```bash
+bash drug_agent/scripts/run_qwen3_5_4b_drug_sft_full.sh
+```
+
+The full entrypoint uses slime's epoch-only mode, so it does not pass `--num-rollout` alongside
+`--num-epoch`. With the current 516-row materialized dataset and `RBS=GBS=4`, slime runs exactly
+129 optimizer steps per epoch. The wrapper refuses to start if the dataset size is not divisible
+by the rollout batch size, preventing an unnoticed dropped tail.
+
+To resume an interrupted full run, explicitly set `RESUME_DIR` to its checkpoint directory. The
+wrapper then uses the same path for both `--load` and `--save`.
+
+The smoke scripts also guard against an even smaller but easy-to-miss failure mode: if your chosen `NUM_ROLLOUT`, `ROLLOUT_BATCH_SIZE`, and `GLOBAL_BATCH_SIZE` combination would make the derived `train_iters` zero, the script will automatically bump `LR_DECAY_ITERS` to `1` so Megatron's scheduler stays valid instead of crashing deep inside initialization.
+
+ToolRL smoke / learn use the same model-specific `MODEL_ARGS_FILE` pattern, but they expect a step-level ToolRL JSONL produced by `drug_agent/toolrl/convert_react_to_toolrl_steps.py`. The reward is the structured dict returned by `drug_agent.toolrl.molclaw_reward.reward_func`, and `--reward-key score` is passed through slime's native reward extraction path.
 
 Optional debug-only switch (default off):
 
@@ -300,7 +399,12 @@ Strict/diagnostic parsing policy:
 
 ## Tool Debug
 
+The following commands perform real tool-environment interaction. They are not training entrypoints
+and require an explicit opt-in:
+
 ```bash
+export DRUG_AGENT_ALLOW_TOOL_ENV=1
+
 python drug_agent/tools_debug/debug_mcp_tools.py --list-tools
 python drug_agent/tools_debug/debug_mcp_tools.py --tool is_valid_smiles --args '{"smiles_list":["CCO"]}'
 
@@ -343,6 +447,7 @@ Notes:
 - We do not add tool-argument alias auto-fixes in gate stage.
 - `Qwen3.5-122B-A10B` / `Qwen3.5-27B` are used for rollout debug or teacher usage, not current actor training.
 - `debug_one_task.py` is permissive debug tooling, not a training reward pipeline.
+- Formal offline audit: `python drug_agent/tools_debug/audit_offline_training.py`.
 
 ## Notes
 
@@ -351,3 +456,5 @@ Notes:
 - Keep rollout strict for RL/SFT evaluation: `DRUG_AGENT_ROLLOUT_MODE=train_strict`, `DRUG_AGENT_ALLOW_PARSE_RECOVERY=0`.
 - `reward_func` returns a dict score payload; scripts pass `--reward-key score`.
 - `pipelined_data` converters emit `skipped_report.jsonl` for auditability.
+- Step-level adversarial distillation lives in [`drug_agent/gad/README.md`](gad/README.md). It starts
+  from an existing SFT checkpoint and keeps its Bradley-Terry discriminator outside slime core.

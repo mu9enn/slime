@@ -8,6 +8,7 @@ else
 fi
 
 cd "$SLIME"
+source drug_agent/scripts/reject_legacy_online_training.sh
 
 unset RAY_ADDRESS || true
 pkill -9 sglang 2>/dev/null || true
