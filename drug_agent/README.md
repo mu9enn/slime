@@ -205,6 +205,8 @@ ToolRL training scripts live under:
 - `drug_agent/toolrl/scripts/run_toolrl_grpo_smoke.sh`
 - `drug_agent/toolrl/scripts/run_toolrl_grpo_learn.sh`
 - `drug_agent/toolrl/scripts/run_toolrl_grpo.sh`
+- `drug_agent/toolrl/scripts/run_qwen3_5_4b_toolrl_smoke.sh`
+- `drug_agent/toolrl/scripts/run_qwen3_5_4b_toolrl_full.sh`
 
 ToolRL is offline by design. It uses slime's native single-response rollout and the custom reward hook
 `drug_agent.toolrl.molclaw_reward.reward_func`; it does not call MCP or MolClaw tools during training.
@@ -216,6 +218,11 @@ python drug_agent/toolrl/validate_toolrl_offline_data.py \
 
 python drug_agent/tools_debug/debug_toolrl_offline_no_tool_call.py
 ```
+
+Qwen3.5-4B OPD entrypoints live under `drug_agent/opd/scripts/`. They use slime-native
+`--opd-type megatron`, fixed offline decision states, and no tool execution. The default frozen
+teacher is the base 4B `torch_dist` checkpoint; override `OPD_TEACHER_LOAD` with a stronger
+architecture-compatible 4B checkpoint for a quality-oriented experiment.
 
 ## Protocol
 

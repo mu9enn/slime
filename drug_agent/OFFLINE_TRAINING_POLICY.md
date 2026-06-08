@@ -12,6 +12,7 @@
 | Offline ToolRL-style RL | Fixed step state | slime-native SGLang next-action generation | reference tool-call rule reward + GRPO | Forbidden |
 | GAD Stage 2 | Fixed step state | current SFT student next-action generation | zero student reward; cache negatives; BT warmup | Forbidden |
 | GAD Stage 3 | Fixed step state | current student next-action generation | discriminator `/score-and-update` + rule reward + GRPO | Forbidden |
+| OPD | Fixed step state | current student next-action generation | frozen Megatron teacher KL + GRPO | Forbidden |
 
 Observations in these datasets are immutable historical context. Generated tool calls are scored as
 text/actions and never used to request another observation.

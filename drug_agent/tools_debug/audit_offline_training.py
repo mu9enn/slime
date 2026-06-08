@@ -19,6 +19,9 @@ FORMAL_SCRIPTS = {
     "gad_discriminator_service": ROOT / "gad/scripts/serve_discriminator.sh",
     "gad_stage3": ROOT / "gad/scripts/run_stage3_gad_grpo.sh",
     "gad_stage3_smoke": ROOT / "gad/scripts/run_stage3_gad_grpo_smoke.sh",
+    "opd": ROOT / "opd/scripts/run_qwen3_5_4b_opd.sh",
+    "opd_smoke": ROOT / "opd/scripts/run_qwen3_5_4b_opd_smoke.sh",
+    "opd_full": ROOT / "opd/scripts/run_qwen3_5_4b_opd_full.sh",
 }
 FORMAL_HOOKS = {
     "sft_materialize": ROOT / "data/materialize_sft_jsonl.py",
@@ -65,6 +68,7 @@ def _delegates_to_guarded_entry(text: str) -> bool:
         "run_qwen3_5_0_8b_drug_sft_smoke.sh",
         "run_toolrl_grpo.sh",
         "run_stage3_gad_grpo.sh",
+        "run_qwen3_5_4b_opd.sh",
     )
     return any(entry in text for entry in guarded_entries)
 
@@ -115,6 +119,7 @@ def audit() -> dict[str, Any]:
     gad_stage2 = _read(FORMAL_SCRIPTS["gad_stage2_negatives"])
     sft = _read(FORMAL_SCRIPTS["sft"])
     toolrl = _read(FORMAL_SCRIPTS["toolrl"])
+    opd = _read(FORMAL_SCRIPTS["opd"])
     training_contract = {
         "sft_native_teacher_forcing": "slime.rollout.sft_rollout.generate_rollout" in sft
         and "--loss-type sft_loss" in sft,
@@ -123,6 +128,9 @@ def audit() -> dict[str, Any]:
         "toolrl_offline_rule_reward": "drug_agent.toolrl.molclaw_reward.reward_func" in toolrl,
         "toolrl_hooks_not_environment_overridable": "ROLLOUT_FUNCTION_PATH=${" not in toolrl
         and "CUSTOM_RM_PATH=${" not in toolrl,
+        "opd_megatron_teacher": "--use-opd" in opd and "--opd-type megatron" in opd,
+        "opd_current_student_generation": "--custom-generate-function-path" not in opd,
+        "opd_zero_tool_reward": "drug_agent.gad.negative_cache.zero_reward" in opd,
     }
     if not all(training_contract.values()):
         findings.append({"severity": "critical", "type": "offline_training_contract_broken", "details": training_contract})

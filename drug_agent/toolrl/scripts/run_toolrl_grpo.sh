@@ -10,6 +10,13 @@ fi
 cd "$SLIME"
 source drug_agent/scripts/offline_training_env.sh
 
+if [[ "${PYTORCH_CUDA_ALLOC_CONF:-}" == *"expandable_segments"* ]]; then
+  unset PYTORCH_CUDA_ALLOC_CONF
+fi
+if [[ "${PYTORCH_ALLOC_CONF:-}" == *"expandable_segments"* ]]; then
+  unset PYTORCH_ALLOC_CONF
+fi
+
 unset RAY_ADDRESS || true
 pkill -9 sglang 2>/dev/null || true
 sleep 2
@@ -41,6 +48,7 @@ REF_LOAD=${REF_LOAD:-$VERL_DATA/Qwen3.5-0.8B_torch_dist}
 SAVE_DIR=${SAVE_DIR:-$VERL_DATA/Qwen3.5-0.8B_toolrl_grpo}
 SAVE_INTERVAL=${SAVE_INTERVAL:-1}
 LOAD=${LOAD:-}
+TOOLRL_RESUME=${TOOLRL_RESUME:-0}
 
 ROLLOUT_FUNCTION_PATH=slime.rollout.sglang_rollout.generate_rollout
 CUSTOM_RM_PATH=drug_agent.toolrl.molclaw_reward.reward_func
@@ -50,13 +58,29 @@ NUM_ROLLOUT=${NUM_ROLLOUT:-2}
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-8}
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-1}
 ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-2048}
+ROLLOUT_MAX_PROMPT_LEN=${ROLLOUT_MAX_PROMPT_LEN:-}
+ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN:-}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-8}
 NUM_EPOCH=${NUM_EPOCH:-1}
 LR=${LR:-1e-6}
 MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-8192}
+TENSOR_MODEL_PARALLEL_SIZE=${TENSOR_MODEL_PARALLEL_SIZE:-1}
+PIPELINE_MODEL_PARALLEL_SIZE=${PIPELINE_MODEL_PARALLEL_SIZE:-1}
+CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE:-1}
+EXPERT_MODEL_PARALLEL_SIZE=${EXPERT_MODEL_PARALLEL_SIZE:-1}
+EXPERT_TENSOR_PARALLEL_SIZE=${EXPERT_TENSOR_PARALLEL_SIZE:-1}
+ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}
+RECOMPUTE_FULL=${RECOMPUTE_FULL:-0}
+RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-1}
 
-if [ $((GLOBAL_BATCH_SIZE % NUM_GPUS)) -ne 0 ]; then
-  echo "GLOBAL_BATCH_SIZE must be divisible by NUM_GPUS for this script: GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE NUM_GPUS=$NUM_GPUS" >&2
+MODEL_PARALLEL_SIZE=$((TENSOR_MODEL_PARALLEL_SIZE * PIPELINE_MODEL_PARALLEL_SIZE * CONTEXT_PARALLEL_SIZE * EXPERT_MODEL_PARALLEL_SIZE))
+if [ "$MODEL_PARALLEL_SIZE" -le 0 ] || [ $((NUM_GPUS % MODEL_PARALLEL_SIZE)) -ne 0 ]; then
+  echo "NUM_GPUS must be divisible by TP*PP*CP*EP: NUM_GPUS=$NUM_GPUS TP=$TENSOR_MODEL_PARALLEL_SIZE PP=$PIPELINE_MODEL_PARALLEL_SIZE CP=$CONTEXT_PARALLEL_SIZE EP=$EXPERT_MODEL_PARALLEL_SIZE" >&2
+  exit 2
+fi
+DATA_PARALLEL_SIZE=$((NUM_GPUS / MODEL_PARALLEL_SIZE))
+if [ $((GLOBAL_BATCH_SIZE % DATA_PARALLEL_SIZE)) -ne 0 ]; then
+  echo "GLOBAL_BATCH_SIZE must be divisible by DATA_PARALLEL_SIZE: GBS=$GLOBAL_BATCH_SIZE DP=$DATA_PARALLEL_SIZE" >&2
   exit 2
 fi
 
@@ -85,6 +109,9 @@ CKPT_ARGS=(
 )
 if [ -n "$LOAD" ]; then
   CKPT_ARGS+=(--load "$LOAD")
+  if [ "$TOOLRL_RESUME" != "1" ]; then
+    CKPT_ARGS+=(--finetune --no-load-optim --no-load-rng --start-rollout-id 0)
+  fi
 fi
 
 TOOLRL_ARGS=(
@@ -100,9 +127,6 @@ TOOLRL_ARGS=(
   --rollout-shuffle
 
   --advantage-estimator grpo
-  --use-kl-loss
-  --kl-loss-coef 0.00
-  --kl-loss-type low_var_kl
   --entropy-coef 0.00
   --eps-clip 0.2
   --eps-clip-high 0.28
@@ -111,20 +135,36 @@ TOOLRL_ARGS=(
   --rollout-batch-size "$ROLLOUT_BATCH_SIZE"
   --n-samples-per-prompt "$N_SAMPLES_PER_PROMPT"
   --rollout-max-response-len "$ROLLOUT_MAX_RESPONSE_LEN"
+  --rollout-num-gpus-per-engine "$ROLLOUT_NUM_GPUS_PER_ENGINE"
   --global-batch-size "$GLOBAL_BATCH_SIZE"
   --balance-data
 )
+if [ -n "$ROLLOUT_MAX_PROMPT_LEN" ]; then
+  TOOLRL_ARGS+=(--rollout-max-prompt-len "$ROLLOUT_MAX_PROMPT_LEN")
+fi
+if [ -n "$ROLLOUT_MAX_CONTEXT_LEN" ]; then
+  TOOLRL_ARGS+=(--rollout-max-context-len "$ROLLOUT_MAX_CONTEXT_LEN")
+fi
 
 PERF_ARGS=(
-  --tensor-model-parallel-size 1
-  --sequence-parallel
-  --pipeline-model-parallel-size 1
-  --context-parallel-size 1
-  --expert-model-parallel-size 1
-  --expert-tensor-parallel-size 1
+  --tensor-model-parallel-size "$TENSOR_MODEL_PARALLEL_SIZE"
+  --pipeline-model-parallel-size "$PIPELINE_MODEL_PARALLEL_SIZE"
+  --context-parallel-size "$CONTEXT_PARALLEL_SIZE"
+  --expert-model-parallel-size "$EXPERT_MODEL_PARALLEL_SIZE"
+  --expert-tensor-parallel-size "$EXPERT_TENSOR_PARALLEL_SIZE"
   --use-dynamic-batch-size
   --max-tokens-per-gpu "$MAX_TOKENS_PER_GPU"
 )
+if [ "$TENSOR_MODEL_PARALLEL_SIZE" -gt 1 ]; then
+  PERF_ARGS+=(--sequence-parallel)
+fi
+if [ "$RECOMPUTE_FULL" = "1" ]; then
+  PERF_ARGS+=(
+    --recompute-granularity full
+    --recompute-method uniform
+    --recompute-num-layers "$RECOMPUTE_NUM_LAYERS"
+  )
+fi
 
 OPTIMIZER_ARGS=(
   --optimizer adam
